@@ -55,11 +55,13 @@ def get_sparsity_pattern(f, x, type='hessian'): # "jacobian" or "hessian"
         if len(sym_out_flat) == 1:
             out_expr = sym_out_flat[0]
             x_symbols = [s for s in out_expr.free_symbols if str(s).startswith('x')] # when differentiated these terms dont go to zero
-            sym_jac_coo = sym_jac_coo + [[get_var_idx[i]] for i in x_symbols]
+            sym_jac_coo = sym_jac_coo + [[0, get_var_idx[i]] for i in x_symbols]  # always 2-col: [out_idx, x_idx]
         else:
             for out_idx, out_expr in enumerate(sym_out_flat):
                 x_symbols = [s for s in out_expr.free_symbols if str(s).startswith('x')] # when differentiated these terms dont go to zero
                 sym_jac_coo = sym_jac_coo + [[out_idx, get_var_idx[i]] for i in x_symbols]
+        if len(sym_jac_coo) == 0:
+            return np.zeros((0, 2), dtype=np.int64)
         return np.array(sym_jac_coo)
 
     if type == "hessian":
@@ -112,15 +114,8 @@ def sparse_jacobian(f, jac_coo, out_shape):
     # Ensure jac_coo is a JAX array of int
     jac_coo = jnp.array(jac_coo, dtype=jnp.int32)
     ncols = jac_coo.shape[1]
-    # adjust jac_coo to allow for jittability in partial when slicing y on return statement
-    # nrows = jac_coo.shape[0]
-    # jac_coo = jnp.hstack([jnp.zeros([nrows,1], dtype=jnp.int32), jac_coo]) if ncols == 1 else jac_coo
-    
-    # sometimes function is scalar output, giving a leading 1 in the out_shape - we remove it
-    if out_shape[0] == 1:
-        out_shape = out_shape[1:]
 
-    # CASE 1: vector-valued function: R^n -> R^m
+    # CASE 1: vector-valued function: R^n -> R^m (or scalar with 2-col COO)
     #         Each row in jac_coo is [out_idx, x_idx]
     if ncols > 1:  
         def partial_out_j(x, out_idx, x_idx, *args):
@@ -129,7 +124,8 @@ def sparse_jacobian(f, jac_coo, out_shape):
             component of f w.r.t. the x_idx-th component of x.
             """
             # grad_f_out is the gradient of f(...)[out_idx], i.e. R^n -> scalar
-            grad_f_out = jax.grad(lambda z, *args: f(z, *args)[out_idx])(x, *args)
+            # Use ravel() to handle both true scalars () and 1D arrays (m,)
+            grad_f_out = jax.grad(lambda z, *args: f(z, *args).ravel()[out_idx])(x, *args)
             return grad_f_out[x_idx]
 
         def jac_fn(x, *args):
@@ -146,9 +142,12 @@ def sparse_jacobian(f, jac_coo, out_shape):
             # In the style of your sparse_hessian, we'll store shape=jac_coo.shape
             return BCOO((out, jac_coo), shape=out_shape)
 
-    # CASE 2: scalar-valued function: R^n -> R
+    # CASE 2: scalar-valued function: R^n -> R (legacy 1-col COO)
     #         Each row in jac_coo is [x_idx]
     elif ncols == 1:
+        # For legacy 1-col case, strip leading 1 from out_shape
+        if out_shape[0] == 1:
+            out_shape = out_shape[1:]
         def partial_j(x, x_idx, *args):
             """
             Computes d f(x)/dx_x_idx for a scalar function f.
@@ -183,10 +182,7 @@ def sparse_hessian(f, hes_coo, out_shape):
     hes_coo = jnp.array(hes_coo, dtype=jnp.int32)
     ncols = hes_coo.shape[1]
 
-    # sometimes function is scalar output, giving a leading 1 in the out_shape - we remove it
-    if out_shape[0] == 1:
-        out_shape = out_shape[1:]
-
+    # CASE 1: vector-valued or scalar with 3-col COO (includes out_idx)
     if ncols > 2:
 
         def partial_out_ij(x, out_idx, i, j, *args):
@@ -198,8 +194,9 @@ def sparse_hessian(f, hes_coo, out_shape):
             # 1) Define a function g_i(u) = df_{out_idx}(u)/dx_i
             #    i.e., pick out the i-th component from jax.grad(f_{out_idx})(u).
             #    f_{out_idx}(u) means f(u)[out_idx].
+            #    Use ravel() to handle both true scalars () and 1D arrays (m,)
             def g_i(u):
-                return jax.grad(lambda z, *args: f(z, *args)[out_idx])(u, *args)[i]
+                return jax.grad(lambda z, *args: f(z, *args).ravel()[out_idx])(u, *args)[i]
 
             # 2) Now take derivative of g_i w.r.t. x_j
             #    i.e. second partial derivative.
@@ -217,7 +214,11 @@ def sparse_hessian(f, hes_coo, out_shape):
             out = jax.vmap(single_entry)(hes_coo)
             return BCOO([out, hes_coo], shape=out_shape)
         
+    # CASE 2: scalar-valued function hessian (legacy 2-col COO)
     elif ncols == 2:
+        # For legacy 2-col case, strip leading 1 from out_shape
+        if out_shape[0] == 1:
+            out_shape = out_shape[1:]
 
         def partial_ij(x, i, j, *args):
             """
@@ -257,14 +258,24 @@ def get_dense(sp, coo, shape):
 def test_dense_jac(f, f_sp, coo, x):
     # if coo is None: return None
     f_out = f(x)
-    f_dense = get_dense(f_sp(x), coo, f_out.shape)
+    sp_result = f_sp(x)
+    # Use sparse result shape for dense reconstruction
+    f_dense = get_dense(sp_result, coo, sp_result.shape)
+    # Handle scalar output: f_out is (n,) but f_dense is (1, n)
+    if f_dense.ndim > f_out.ndim:
+        f_out = f_out[None, ...]  # Add leading dimension
     discrepancy = np.max(np.abs(f_out - f_dense))
     assert discrepancy <= 1e-6
 
 def test_dense_hess(f, f_sp, coo, x, plot=False):
     # if coo is None: return None
     f_out = f(x)
-    f_dense = get_dense(f_sp(x), coo, f_out.shape)
+    sp_result = f_sp(x)
+    # Use sparse result shape for dense reconstruction
+    f_dense = get_dense(sp_result, coo, sp_result.shape)
+    # Handle scalar output: f_out is (n, n) but f_dense is (1, n, n)
+    if f_dense.ndim > f_out.ndim:
+        f_out = f_out[None, ...]
     discrepancy = np.max(np.abs(f_out - f_dense))
     if plot is True:
         x_values = coo[:, 1]
@@ -285,6 +296,11 @@ def test_dense_hess(f, f_sp, coo, x, plot=False):
 def test_coo(f, coos, x):
     # if coos is None: return None
     outs = f(x)
+    # Handle scalar output: COO includes out_idx=0 but jax returns without that dim
+    # Jacobian: COO has [0, x_idx] but jax.jacrev returns 1D -> reshape to (1, n)
+    # Hessian: COO has [0, i, j] but jax.hessian returns 2D -> reshape to (1, n, n)
+    if coos.ndim == 2 and coos.shape[1] == outs.ndim + 1:
+        outs = outs[None, ...]  # Add leading dimension
     sum = np.array(0.)
     for coo in coos:
         sum += outs[*coo]
