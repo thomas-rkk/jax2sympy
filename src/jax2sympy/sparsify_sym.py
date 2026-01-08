@@ -24,9 +24,16 @@ def _remove_unevaluated_derivatives(expr):
     return expr.subs(subs_dict)
 
 
-def _sym_sparse_jacobian(inp_shape, out_flat, out_shape, get_var_idx):
+def _sym_sparse_jacobian(inp_shape, out_flat, out_shape, get_var_idx, x_prefix='x0'):
     """
     Compute symbolic jacobian using sympy differentiation.
+
+    Args:
+        inp_shape: shape of the input to differentiate with respect to
+        out_flat: flattened array of sympy expressions for outputs
+        out_shape: shape of the output
+        get_var_idx: dict mapping symbols to their flat indices
+        x_prefix: prefix of symbols to differentiate with respect to (default 'x0')
 
     Returns:
         sym_jac_val: array of sympy expressions for non-zero jacobian entries
@@ -36,7 +43,8 @@ def _sym_sparse_jacobian(inp_shape, out_flat, out_shape, get_var_idx):
     sym_jac_val = []
     sym_jac_coo = []
     for out_idx, out_expr in enumerate(out_flat):
-        x_symbols = [s for s in out_expr.free_symbols if str(s).startswith('x')]
+        # Filter for symbols belonging to the first input only (e.g., x0_0, x0_1, ...)
+        x_symbols = [s for s in out_expr.free_symbols if str(s).startswith(x_prefix + '_')]
         out_expr_grad = [sy.diff(out_expr, x).doit() for x in x_symbols]
         out_multi_idx = [int(i) for i in np.unravel_index(out_idx, out_shape)]
         for grad_value, symbol in zip(out_expr_grad, x_symbols):
@@ -56,14 +64,23 @@ def _sym_sparse_jacobian(inp_shape, out_flat, out_shape, get_var_idx):
 
 
 def _get_input_symbols(var2sym):
-    """Extract input symbols and build index mapping from var2sym."""
+    """Extract first input's symbols and build index mapping from var2sym.
+
+    Returns:
+        var: the first input variable's symbol array
+        get_var_idx: dict mapping symbols to their flat indices
+        x_prefix: the prefix for this input's symbols (e.g., 'x0')
+    """
     iterator = iter(var2sym)
     var = var2sym[next(iterator)]
     # Handle both 0-d and n-d arrays
     var_flat = np.atleast_1d(var).flatten()
+    # Extract the prefix (e.g., 'x0' from 'x0_0')
+    first_sym_str = str(var_flat[0])
+    x_prefix = first_sym_str.rsplit('_', 1)[0]  # 'x0_0' -> 'x0'
     indices = [int(str(x).split('_')[-1]) for x in var_flat]
     get_var_idx = {k: v for k, v in zip(var_flat, indices)}
-    return var, get_var_idx
+    return var, get_var_idx, x_prefix
 
 
 def _extract_all_symbols(var2sym, jaxpr):
@@ -71,7 +88,7 @@ def _extract_all_symbols(var2sym, jaxpr):
     Extract all symbols (inputs and constants) from var2sym.
 
     Returns:
-        input_symbols: flat array of input sympy symbols
+        all_input_symbols: list of flat arrays of sympy symbols for each input
         const_symbols: list of (symbol_name, const_value) pairs for all constants
     """
     num_inputs = len(jaxpr.jaxpr.invars)
@@ -81,8 +98,8 @@ def _extract_all_symbols(var2sym, jaxpr):
     input_vars = [var2sym[next(iterator)] for _ in range(num_inputs)]
     const_vars = [var2sym[next(iterator)] for _ in range(num_constants)]
 
-    # Flatten input symbols
-    input_symbols = np.atleast_1d(input_vars[0]).flatten()
+    # Flatten input symbols for each input variable
+    all_input_symbols = [np.atleast_1d(var).flatten() for var in input_vars]
 
     # Build constant symbol -> value mapping
     const_symbols = []
@@ -92,88 +109,87 @@ def _extract_all_symbols(var2sym, jaxpr):
         for sym, val in zip(const_flat, const_val_flat):
             const_symbols.append((str(sym), float(val)))
 
-    return input_symbols, const_symbols
+    return all_input_symbols, const_symbols
 
 
-def get_symbolic_jacobian(f, x):
+def get_symbolic_jacobian(f, x, *args):
     """
     Get the symbolic jacobian expressions and sparsity pattern.
 
     Args:
         f: JAX function
         x: sample input array
+        *args: additional arguments to f (for tracing)
 
     Returns:
         sym_jac_val: array of sympy expressions for non-zero entries
         sym_jac_coo: coordinate array of shape (nnz, 2) with [out_idx, inp_idx]
-        input_symbols: flat array of input sympy symbols (for substitution)
+        all_input_symbols: list of flat arrays of input sympy symbols (x first, then args)
         const_symbols: list of (name, value) pairs for constant symbols
     """
-    jaxpr = jax.make_jaxpr(f)(x)
+    jaxpr = jax.make_jaxpr(f)(x, *args)
     out_syms, var2sym, _, _ = jaxpr_to_sympy_expressions(jaxpr, var2sym=dict())
 
     out_syms = out_syms[0]
-    num_inputs = len(jaxpr.jaxpr.invars)
-    assert num_inputs == 1, "Only single input functions supported"
 
-    var, get_var_idx = _get_input_symbols(var2sym)
+    # Get first input (x) for jacobian differentiation
+    var, get_var_idx, x_prefix = _get_input_symbols(var2sym)
     inp_shape = np.atleast_1d(var).shape
     sym_out_flat = np.atleast_1d(out_syms).flatten()
     sym_out_shape = np.atleast_1d(out_syms).shape
 
     sym_jac_val, sym_jac_coo = _sym_sparse_jacobian(
-        inp_shape, sym_out_flat, sym_out_shape, [get_var_idx]
+        inp_shape, sym_out_flat, sym_out_shape, [get_var_idx], x_prefix
     )
 
-    # Extract all symbols including constants
-    input_symbols, const_symbols = _extract_all_symbols(var2sym, jaxpr)
+    # Extract all symbols including args and constants
+    all_input_symbols, const_symbols = _extract_all_symbols(var2sym, jaxpr)
 
-    return sym_jac_val, sym_jac_coo, input_symbols, const_symbols
+    return sym_jac_val, sym_jac_coo, all_input_symbols, const_symbols
 
 
-def get_symbolic_hessian(f, x):
+def get_symbolic_hessian(f, x, *args):
     """
     Get the symbolic hessian expressions and sparsity pattern.
 
     Args:
         f: JAX function
         x: sample input array
+        *args: additional arguments to f (for tracing)
 
     Returns:
         sym_hess_val: array of sympy expressions for non-zero entries
         sym_hess_coo: coordinate array of shape (nnz, 3) with [out_idx, i, j]
-        input_symbols: flat array of input sympy symbols (for substitution)
+        all_input_symbols: list of flat arrays of input sympy symbols (x first, then args)
         const_symbols: list of (name, value) pairs for constant symbols
     """
-    jaxpr = jax.make_jaxpr(f)(x)
+    jaxpr = jax.make_jaxpr(f)(x, *args)
     out_syms, var2sym, _, _ = jaxpr_to_sympy_expressions(jaxpr, var2sym=dict())
 
-    num_inputs = len(jaxpr.jaxpr.invars)
-    assert num_inputs == 1, "Only single input functions supported"
-
-    var, get_var_idx = _get_input_symbols(var2sym)
+    # Get first input (x) for hessian differentiation
+    var, get_var_idx, x_prefix = _get_input_symbols(var2sym)
     inp_shape = np.atleast_1d(var).shape
     sym_out_flat = np.atleast_1d(out_syms[0]).flatten()
     sym_out_shape = np.atleast_1d(out_syms[0]).shape
 
-    # Extract all symbols including constants
-    input_symbols, const_symbols = _extract_all_symbols(var2sym, jaxpr)
+    # Extract all symbols including args and constants
+    all_input_symbols, const_symbols = _extract_all_symbols(var2sym, jaxpr)
 
     # First differentiation: get jacobian
     sym_jac_val, sym_jac_coo = _sym_sparse_jacobian(
-        inp_shape, sym_out_flat, sym_out_shape, [get_var_idx]
+        inp_shape, sym_out_flat, sym_out_shape, [get_var_idx], x_prefix
     )
 
     if len(sym_jac_val) == 0:
-        return np.array([], dtype=object), np.zeros((0, 3), dtype=np.int64), input_symbols, const_symbols
+        return np.array([], dtype=object), np.zeros((0, 3), dtype=np.int64), all_input_symbols, const_symbols
 
     # Second differentiation: get hessian
     sym_hess_val, sym_hess_coo = _sym_sparse_jacobian(
-        inp_shape, sym_jac_val, sym_jac_val.shape, [get_var_idx]
+        inp_shape, sym_jac_val, sym_jac_val.shape, [get_var_idx], x_prefix
     )
 
     if sym_hess_coo.size == 0:
-        return np.array([], dtype=object), np.zeros((0, 3), dtype=np.int64), input_symbols, const_symbols
+        return np.array([], dtype=object), np.zeros((0, 3), dtype=np.int64), all_input_symbols, const_symbols
 
     # Map coordinates: hess_coo[:,0] indexes into jac_coo, need to expand
     # sym_hess_coo is [jac_entry_idx, inp_idx]
@@ -186,14 +202,14 @@ def get_symbolic_hessian(f, x):
         for i, v in enumerate(sym_hess_coo[:, 0])
     ])
 
-    return sym_hess_val, full_hess_coo, input_symbols, const_symbols
+    return sym_hess_val, full_hess_coo, all_input_symbols, const_symbols
 
 
 #######################################
 # ----- JAX Function Generation ----- #
 #######################################
 
-def sparse_jacobian_sym(f, x):
+def sparse_jacobian_sym(f, x, *sample_args, coo_pattern=None, out_shape=None):
     """
     Create a sparse jacobian function using symbolic differentiation.
 
@@ -203,15 +219,54 @@ def sparse_jacobian_sym(f, x):
     Args:
         f: JAX function
         x: sample input array
+        *sample_args: sample additional arguments (for tracing)
+        coo_pattern: optional COO pattern array of shape (nnz, 2) with [out_idx, x_idx].
+                    If None, computed from symbolic differentiation.
+                    If provided, symbolic expressions are filtered to match this pattern.
+        out_shape: optional output shape (m, n). If None, inferred from function and x.
 
     Returns:
-        jac_fn: function that takes x and returns BCOO sparse jacobian
+        jac_fn: function that takes (x, *args) and returns BCOO sparse jacobian
     """
     from sympy2jax import SymbolicModule
 
-    sym_jac_val, sym_jac_coo, input_symbols, const_symbols = get_symbolic_jacobian(f, x)
+    sym_jac_val, sym_jac_coo, all_input_symbols, const_symbols = get_symbolic_jacobian(f, x, *sample_args)
 
-    out_shape = (f(x).size, x.size)
+    # Determine output shape
+    if out_shape is None:
+        out_shape = (f(x, *sample_args).size, x.size)
+
+    # Handle provided COO pattern
+    if coo_pattern is not None:
+        coo_pattern = np.atleast_2d(coo_pattern)
+        if len(coo_pattern) == 0 or coo_pattern.size == 0:
+            return lambda x, *args: BCOO(
+                (jnp.array([]), jnp.zeros((0, 2), dtype=jnp.int32)),
+                shape=out_shape
+            )
+
+        # Handle legacy 1-col COO for scalar functions: [x_idx] without out_idx
+        # The original sparse_jacobian handles this by stripping the leading 1 from out_shape
+        is_legacy_1col = coo_pattern.shape[1] == 1
+        if is_legacy_1col and out_shape[0] == 1:
+            out_shape = out_shape[1:]
+
+        # Create mapping from symbolic COO to expression index
+        coo_to_idx = {tuple(coo): i for i, coo in enumerate(sym_jac_coo)}
+
+        # Build filtered expressions for provided pattern
+        filtered_val = []
+        for coo in coo_pattern:
+            # For legacy 1-col, prepend 0 to match 2-col symbolic format
+            lookup_coo = tuple([0] + list(coo)) if is_legacy_1col else tuple(coo)
+            idx = coo_to_idx.get(lookup_coo)
+            if idx is not None:
+                filtered_val.append(sym_jac_val[idx])
+            else:
+                # Entry not in symbolic pattern - this is zero
+                filtered_val.append(sy.Integer(0))
+        sym_jac_val = np.array(filtered_val, dtype=object)
+        sym_jac_coo = coo_pattern
 
     if len(sym_jac_coo) == 0:
         return lambda x, *args: BCOO(
@@ -221,20 +276,30 @@ def sparse_jacobian_sym(f, x):
 
     jac_coo = jnp.array(sym_jac_coo, dtype=jnp.int32)
 
-    # Build symbol name to index mapping for sympy2jax
-    sym_names = [str(s) for s in input_symbols]
+    # Build symbol name lists for each input
+    all_sym_names = [[str(s) for s in syms] for syms in all_input_symbols]
 
     # Convert sympy expressions to JAX function via sympy2jax
-    # SymbolicModule expects a list/pytree of expressions
     sym_module = SymbolicModule(list(sym_jac_val))
 
     # Pre-build constant dict (these don't change)
     const_dict = {name: val for name, val in const_symbols}
 
     def jac_fn(x, *args):
-        x_flat = x.flatten()
-        # Create symbol -> value mapping (inputs + constants)
-        sym_dict = {name: x_flat[i] for i, name in enumerate(sym_names)}
+        # Create symbol -> value mapping for all inputs
+        sym_dict = {}
+        # First input is x
+        x_flat = jnp.atleast_1d(x).flatten()
+        for i, name in enumerate(all_sym_names[0]):
+            sym_dict[name] = x_flat[i]
+        # Additional args - only process args that have corresponding symbols
+        # (runtime may pass more args than were traced, but unused args won't have symbols)
+        num_traced_args = len(all_sym_names) - 1  # subtract 1 for x
+        for arg_idx, arg in enumerate(args[:num_traced_args]):
+            arg_flat = jnp.atleast_1d(arg).flatten()
+            for i, name in enumerate(all_sym_names[arg_idx + 1]):
+                sym_dict[name] = arg_flat[i]
+        # Add constants
         sym_dict.update(const_dict)
         # Evaluate all jacobian entries
         jac_vals = sym_module(**sym_dict)
@@ -243,7 +308,7 @@ def sparse_jacobian_sym(f, x):
     return jac_fn
 
 
-def sparse_hessian_sym(f, x):
+def sparse_hessian_sym(f, x, *sample_args, coo_pattern=None, out_shape=None):
     """
     Create a sparse hessian function using symbolic differentiation.
 
@@ -253,15 +318,55 @@ def sparse_hessian_sym(f, x):
     Args:
         f: JAX function
         x: sample input array
+        *sample_args: sample additional arguments (for tracing)
+        coo_pattern: optional COO pattern array of shape (nnz, 3) with [out_idx, i, j].
+                    If None, computed from symbolic differentiation.
+                    If provided, symbolic expressions are filtered to match this pattern.
+        out_shape: optional output shape (m, n, n). If None, inferred from function and x.
 
     Returns:
-        hess_fn: function that takes x and returns BCOO sparse hessian
+        hess_fn: function that takes (x, *args) and returns BCOO sparse hessian
     """
     from sympy2jax import SymbolicModule
 
-    sym_hess_val, sym_hess_coo, input_symbols, const_symbols = get_symbolic_hessian(f, x)
+    sym_hess_val, sym_hess_coo, all_input_symbols, const_symbols = get_symbolic_hessian(f, x, *sample_args)
 
-    out_shape = (f(x).size, x.size, x.size)
+    # Determine output shape
+    if out_shape is None:
+        out_shape = (f(x, *sample_args).size, x.size, x.size)
+
+    # Handle provided COO pattern
+    if coo_pattern is not None:
+        coo_pattern = np.atleast_2d(coo_pattern)
+        if len(coo_pattern) == 0 or coo_pattern.size == 0:
+            return lambda x, *args: BCOO(
+                (jnp.array([]), jnp.zeros((0, 3), dtype=jnp.int32)),
+                shape=out_shape
+            )
+
+        # Handle legacy 2-col COO for scalar functions: [i, j] without out_idx
+        # The original sparse_hessian handles this by stripping the leading 1 from out_shape
+        is_legacy_2col = coo_pattern.shape[1] == 2
+        if is_legacy_2col and out_shape[0] == 1:
+            out_shape = out_shape[1:]
+
+        # Create mapping from symbolic COO to expression index
+        # For 2-col provided COO, we need to match against 3-col symbolic COO by prepending 0
+        coo_to_idx = {tuple(coo): i for i, coo in enumerate(sym_hess_coo)}
+
+        # Build filtered expressions for provided pattern
+        filtered_val = []
+        for coo in coo_pattern:
+            # For legacy 2-col, prepend 0 to match 3-col symbolic format
+            lookup_coo = tuple([0] + list(coo)) if is_legacy_2col else tuple(coo)
+            idx = coo_to_idx.get(lookup_coo)
+            if idx is not None:
+                filtered_val.append(sym_hess_val[idx])
+            else:
+                # Entry not in symbolic pattern - this is zero
+                filtered_val.append(sy.Integer(0))
+        sym_hess_val = np.array(filtered_val, dtype=object)
+        sym_hess_coo = coo_pattern
 
     if len(sym_hess_coo) == 0:
         return lambda x, *args: BCOO(
@@ -271,8 +376,8 @@ def sparse_hessian_sym(f, x):
 
     hess_coo = jnp.array(sym_hess_coo, dtype=jnp.int32)
 
-    # Build symbol name to index mapping
-    sym_names = [str(s) for s in input_symbols]
+    # Build symbol name lists for each input
+    all_sym_names = [[str(s) for s in syms] for syms in all_input_symbols]
 
     # Convert sympy expressions to JAX function
     sym_module = SymbolicModule(list(sym_hess_val))
@@ -281,9 +386,22 @@ def sparse_hessian_sym(f, x):
     const_dict = {name: val for name, val in const_symbols}
 
     def hess_fn(x, *args):
-        x_flat = x.flatten()
-        sym_dict = {name: x_flat[i] for i, name in enumerate(sym_names)}
+        # Create symbol -> value mapping for all inputs
+        sym_dict = {}
+        # First input is x
+        x_flat = jnp.atleast_1d(x).flatten()
+        for i, name in enumerate(all_sym_names[0]):
+            sym_dict[name] = x_flat[i]
+        # Additional args - only process args that have corresponding symbols
+        # (runtime may pass more args than were traced, but unused args won't have symbols)
+        num_traced_args = len(all_sym_names) - 1  # subtract 1 for x
+        for arg_idx, arg in enumerate(args[:num_traced_args]):
+            arg_flat = jnp.atleast_1d(arg).flatten()
+            for i, name in enumerate(all_sym_names[arg_idx + 1]):
+                sym_dict[name] = arg_flat[i]
+        # Add constants
         sym_dict.update(const_dict)
+        # Evaluate all hessian entries
         hess_vals = sym_module(**sym_dict)
         return BCOO((jnp.array(hess_vals), hess_coo), shape=out_shape)
 
