@@ -155,16 +155,18 @@ def _sym_dot_general(a, b, eqn):
     (contracting_dims_A, contracting_dims_B), (batch_dims_A, batch_dims_B) = eqn.params.get("dimension_numbers", None)
 
     a_ein = [chr(97 + i) for i in range(len(a.shape))]
-    b_ein = [chr(97 + i) for i in range(len(a_ein), len(b.shape) + len(a_ein))]
+    b_ein = [chr(97 + len(a.shape) + i) for i in range(len(b.shape))]
 
     # align b_ein with a_ein
-    b_ein[contracting_dims_B[0]] = a_ein[contracting_dims_A[0]]
+    for a_idx, b_idx in zip(batch_dims_A + contracting_dims_A, batch_dims_B + contracting_dims_B):
+        b_ein[b_idx] = a_ein[a_idx]
 
-    # form output shape - contracting dimension removed from larger dimension input
-    if len(a.shape) >= len(b.shape):
-        out_ein = a_ein[:contracting_dims_A[0]] + a_ein[contracting_dims_A[0] + 1:]
-    else:
-        out_ein = b_ein[:contracting_dims_B[0]] + b_ein[contracting_dims_B[0] + 1:]
+    # find free dimensions
+    a_free = [i for i in range(len(a.shape)) if i not in contracting_dims_A and i not in batch_dims_A]
+    b_free = [i for i in range(len(b.shape)) if i not in contracting_dims_B and i not in batch_dims_B]
+
+    # form output
+    out_ein = [a_ein[i] for i in batch_dims_A] + [a_ein[i] for i in a_free] + [b_ein[i] for i in b_free]
 
     # form strings from lists of characters
     a_ein = ''.join(a_ein)
